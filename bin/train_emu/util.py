@@ -6,7 +6,7 @@ def data_dir():
     '''
     dat_dirs = [
             '/pscratch/sd/c/chahah/jaxsed/',  # perlmutter
-            #'/tigress/chhahn/sedflow/', # tiger
+            '/tigress/chhahn/jaxsed/', # tiger
             #'/scratch/network/chhahn/sedflow/', # adroit 
             #'/Users/chahah/data/sedflow/' # mbp
             ]
