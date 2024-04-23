@@ -8,14 +8,14 @@ def train_nn(iwave):
     '''
     cntnt = '\n'.join([ 
         "#!/bin/bash",
-        "#SBATCH --job-name=train_mlp",
+        "#SBATCH --job-name=train_emu.w%i" % iwave,
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks=1",
         "#SBATCH --cpus-per-task=1",
         "#SBATCH --mem-per-cpu=4G", 
         "#SBATCH --gres=gpu:1", 
         "#SBATCH --time=04:00:00",
-        "$SBATCH -o o/train_mlp%i.o" % iwave, 
+        "$SBATCH -o o/emu%i.o" % iwave, 
         "",
         'now=$(date +"%T")',
         'echo "start time ... $now"',
@@ -38,3 +38,5 @@ def train_nn(iwave):
     os.system('rm _train.slurm')
     return None
 
+
+train_nn(0)

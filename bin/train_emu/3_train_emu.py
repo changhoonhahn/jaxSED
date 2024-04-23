@@ -15,6 +15,7 @@ from jax.tree_util import tree_map
 
 import optax
 import functools
+import optuna 
 
 import torch
 from torch.utils import data
@@ -27,18 +28,32 @@ import util as U
 ########################################################################################
 iwave = int(sys.argv[1])
 
-
 ########################################################################################
 # load data
 ########################################################################################
-thetas = []
+_thetas = []
 for i in range(10):
-    thetas.append(np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.0.thetas_sps.npz'))['arr_0'])
-thetas = np.concatenate(thetas, axis=0)
+    _thetas.append(np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.thetas_sps.npz' % iwave))['arr_0'])
+_thetas = np.concatenate(_thetas, axis=0)
 
-x_pca = np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.x_pca.w%i.npy' % iwave))
+# whiten thetas  
+avg_thetas = np.mean(_thetas, axis=0)
+std_thetas = np.std(_thetas, axis=0)
+thetas = (_thetas - avg_thetas)/std_thetas
+np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.avg_thetas_sps.npy' % iwave), avg_thetas)
+np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.std_thetas_sps.npy' % iwave), std_thetas)
 
 
+_x_pca = np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.x_pca.w%i.npy' % iwave))
+
+# whiten pcas 
+avg_x_pca = np.mean(_x_pca, axis=0)
+std_x_pca = np.std(_x_pca, axis=0)
+x_pca = (_x_pca - avg_x_pca)/std_x_pca
+np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.avg_x_pca.npy' % iwave), avg_x_pca)
+np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.std_x_pca.npy' % iwave), std_x_pca)
+
+# set up pytorch data loaders
 def numpy_collate(batch):
     return tree_map(np.asarray, data.default_collate(batch))
 
@@ -103,55 +118,99 @@ def mse_loss(params, inputs, targets):
     preds = forward(params, inputs)
     return jnp.mean((preds - targets) ** 2)
 
-########################################################################################
-# train MLP 
-########################################################################################
 @jit
 def update(params, opt_state, inputs, targets):
     loss, grads = jax.value_and_grad(mse_loss)(params, inputs, targets)
-    updates, opt_state = optimizer.update(grads, opt_state)
+    updates, opt_state = gradient_transform.update(grads, opt_state)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss
 
+##################################################################################
+# OPTUNA
+##################################################################################
+# Optuna Parameters
+n_trials    = 1000
+study_name  = 'emu_pca.modelb.w%i' % iwave
+n_jobs     = 1
+if not os.path.isdir(os.path.join(U.data_dir(), 'emus', 'modelb', study_name)):
+    os.system('mkdir %s' % os.path.join(U.data_dir(), 'emus', 'modelb', study_name))
+storage    = 'sqlite:///%s/%s/%s.db' % (U.data_dir(), 'emus', 'modelb', study_name, study_name)
+n_startup_trials = 20
 
-layer_sizes = [thetas.shape[1], 128, 128, 128, x_pca.shape[1]]
-learning_rate = 1e-3
+n_layers_min, n_layers_max = 2, 10
+n_hidden_min, n_hidden_max = 64, 1024 
+decay_rate_min, decay_rate_max = 0., 1.
 
-# Initialize the MLP and optimizer
-params = init_mlp_params(layer_sizes)
-optimizer = optax.adam(learning_rate)
+def Objective(trial):
+    ''' bojective function for optuna 
+    '''
+    # Generate the model                                         
+    n_layers = trial.suggest_int("n_layers", n_layers_min, n_layers_max)
+    n_hidden = trial.suggest_int("n_hidden", n_hidden_min, n_hidden_max)
+    decay_rate = trial.suggest_float("lr", decay_rate_min, decay_rate_max) 
 
-# Initialize optimizer state
-opt_state = optimizer.init(params)
+    # train MLP 
+    layer_sizes = [thetas.shape[1]] + [n_hidden for range(n_layers)] + [x_pca.shape[1]]
+    learning_rate = 1e-3
 
-# Training loop
-train_loss, valid_loss = [], []
-for epoch in range(100):
-    epoch_loss = 0.0
-    for x, y in train_dataloader:
-        params, opt_state, loss = update(params, opt_state, x, y)
-        epoch_loss += loss
-    epoch_loss /= len(train_dataloader)
-    train_loss.append(epoch_loss)
+    # Initialize the MLP, optimizer, and scheduler
+    params = init_mlp_params(layer_sizes)
+    optimizer = optax.adam(learning_rate)
 
-    _loss = 0
-    for x, y in valid_dataloader:
-        loss = mse_loss(params, x, y)
-        _loss += loss
-    valid_loss.append(_loss/len(valid_dataloader))
+    total_steps = n_epochs*len(train_dataloader)
+    scheduler = optax.exponential_decay(init_value=learning_rate, 
+                                        transition_steps=total_steps, 
+                                        transition_begin=int(total_steps*0.25),
+                                        decay_rate=decay_rate)
 
-    # early stopping after 20 epochs
-    if valid_loss[-1] < best_valid_loss:
-        best_valid_loss = valid_loss[-1]
-        best_epoch = epoch
-        best_params = params.copy() 
+    # Combining gradient transforms using `optax.chain`.
+    gradient_transform = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Clip by the gradient by the global norm.
+        optax.scale_by_adam(),  # Use the updates from adam.
+        optax.scale_by_schedule(scheduler),  # Use the learning rate from the scheduler.
+        # Scale updates by -1 since optax.apply_updates is additive and we want to descend on the loss.
+        optax.scale(-1.0)
+    )
 
-    if epoch > best_epoch + 20:
-        print(f"Epoch {epoch}, Loss: {epoch_loss}, Valid Loss: {valid_loss[-1]}")
-        break
+    # Initialize optimizer state
+    opt_state = gradient_transform.init(params)
 
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch}, Loss: {epoch_loss}, Valid Loss: {valid_loss[-1]}")
+    # Training loop
+    train_loss, valid_loss = [], []
+    for epoch in range(100):
+        epoch_loss = 0.0
+        for x, y in train_dataloader:
+            params, opt_state, loss = update(params, opt_state, x, y)
+            epoch_loss += loss
+        epoch_loss /= len(train_dataloader)
+        train_loss.append(epoch_loss)
 
-# save trained parameters 
-#np.save
+        _loss = 0
+        for x, y in valid_dataloader:
+            loss = mse_loss(params, x, y)
+            _loss += loss
+        valid_loss.append(_loss/len(valid_dataloader))
+
+        # early stopping after 20 epochs
+        if valid_loss[-1] < best_valid_loss:
+            best_valid_loss = valid_loss[-1]
+            best_epoch = epoch
+            best_params = params.copy() 
+
+        if epoch > best_epoch + 20:
+            print(f"Epoch {epoch}, Loss: {epoch_loss}, Valid Loss: {valid_loss[-1]}")
+            break
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}, Loss: {epoch_loss}, Valid Loss: {valid_loss[-1]}")
+
+    # save trained parameters 
+    with open(os.path.join(U.data_dir(), 'emus', 'modelb', '%s.%i.pkl' % (study_name, trial)), 'wb') as f:
+        pickle.dump(best_params, f)
+    return best_valid_loss
+
+sampler     = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials) 
+study       = optuna.create_study(study_name=study_name, sampler=sampler, storage=storage, directions=["minimize"], load_if_exists=True) 
+
+study.optimize(Objective, n_trials=n_trials, n_jobs=n_jobs)
+print("  Number of finished trials: %i" % len(study.trials))
