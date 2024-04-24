@@ -16,6 +16,7 @@ from jax.tree_util import tree_map
 import optax
 import functools
 import optuna 
+import pickle 
 
 import torch
 from torch.utils import data
@@ -27,21 +28,25 @@ import util as U
 # input 
 ########################################################################################
 iwave = int(sys.argv[1])
-
 ########################################################################################
 # load data
 ########################################################################################
 _thetas = []
+_t_ages = [] 
 for i in range(10):
-    _thetas.append(np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.thetas_sps.npz' % iwave))['arr_0'])
+    _thetas.append(np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.thetas_sps.npz' % i))['arr_0'])
+    _t_ages.append(np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.tages.npz' % i))['arr_0'])
 _thetas = np.concatenate(_thetas, axis=0)
+_t_ages = np.concatenate(_t_ages, axis=0) 
+_thetas = np.concatenate([_thetas, _t_ages[:,None]], axis=1) 
 
 # whiten thetas  
 avg_thetas = np.mean(_thetas, axis=0)
 std_thetas = np.std(_thetas, axis=0)
 thetas = (_thetas - avg_thetas)/std_thetas
-np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.avg_thetas_sps.npy' % iwave), avg_thetas)
-np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.std_thetas_sps.npy' % iwave), std_thetas)
+if not os.path.isfile(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.avg_thetas.npy' % iwave)): 
+    np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.avg_thetas.npy' % iwave), avg_thetas)
+    np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.std_thetas.npy' % iwave), std_thetas)
 
 
 _x_pca = np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.x_pca.w%i.npy' % iwave))
@@ -50,8 +55,9 @@ _x_pca = np.load(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.
 avg_x_pca = np.mean(_x_pca, axis=0)
 std_x_pca = np.std(_x_pca, axis=0)
 x_pca = (_x_pca - avg_x_pca)/std_x_pca
-np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.avg_x_pca.npy' % iwave), avg_x_pca)
-np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.%i.std_x_pca.npy' % iwave), std_x_pca)
+if not os.path.isfile(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.avg_x_pca.npy' % iwave)): 
+    np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.avg_x_pca.npy' % iwave), avg_x_pca)
+    np.save(os.path.join(U.data_dir(), 'seds', 'modelb', 'train_sed.modelb.w%i.std_x_pca.npy' % iwave), std_x_pca)
 
 # set up pytorch data loaders
 def numpy_collate(batch):
@@ -93,20 +99,21 @@ def init_mlp_params(layer_sizes, scale=1e-2):
     keys = random.split(random.PRNGKey(1), len(layer_sizes))
 
     params = []
-    for i, key in zip(np.arange(len(layer_sizes)-2), keys):
+    for i, key in zip(np.arange(len(layer_sizes)-2), keys): 
         m, n = layer_sizes[i], layer_sizes[i+1]
         w_key, b_key, _a_key, _b_key = random.split(key, num=4)
-        params.append([scale * random.normal(w_key, (n, m)), scale * random.normal(b_key, (n,)),
+        params.append([scale * random.normal(w_key, (n, m)), scale * random.normal(b_key, (n,)), 
                       scale * random.normal(_a_key, (n,)), scale * random.normal(_b_key, (n,))])
 
-    m, n = layer_sizes[-2], layer_sizes[-1]
-    w_key, b_key, _a_key, _b_key = random.split(keys[-1], num=4)
+    m, n = layer_sizes[-2], layer_sizes[-1]        
+    w_key, b_key = random.split(keys[-1], num=2)
     params.append([scale * random.normal(w_key, (n, m)), scale * random.normal(b_key, (n,))])
     return params
 
 @functools.partial(jax.vmap, in_axes=(None, 0))
 def forward(params, inputs):
     activations = inputs
+    #for w, b in params[:-1]:
     for w, b, beta, gamma in params[:-1]:
         outputs = jnp.dot(w, activations) + b
         activations = nonlin_act(outputs, beta, gamma) #relu(outputs)#
@@ -118,13 +125,6 @@ def mse_loss(params, inputs, targets):
     preds = forward(params, inputs)
     return jnp.mean((preds - targets) ** 2)
 
-@jit
-def update(params, opt_state, inputs, targets):
-    loss, grads = jax.value_and_grad(mse_loss)(params, inputs, targets)
-    updates, opt_state = gradient_transform.update(grads, opt_state)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
-
 ##################################################################################
 # OPTUNA
 ##################################################################################
@@ -134,9 +134,10 @@ study_name  = 'emu_pca.modelb.w%i' % iwave
 n_jobs     = 1
 if not os.path.isdir(os.path.join(U.data_dir(), 'emus', 'modelb', study_name)):
     os.system('mkdir %s' % os.path.join(U.data_dir(), 'emus', 'modelb', study_name))
-storage    = 'sqlite:///%s/%s/%s.db' % (U.data_dir(), 'emus', 'modelb', study_name, study_name)
+storage    = 'sqlite:///%s/%s/%s.db' % (os.path.join(U.data_dir(), 'emus', 'modelb'), study_name, study_name)
 n_startup_trials = 20
 
+n_epochs=1000
 n_layers_min, n_layers_max = 2, 10
 n_hidden_min, n_hidden_max = 64, 1024 
 decay_rate_min, decay_rate_max = 0., 1.
@@ -144,14 +145,21 @@ decay_rate_min, decay_rate_max = 0., 1.
 def Objective(trial):
     ''' bojective function for optuna 
     '''
+    @jit
+    def update(params, opt_state, inputs, targets):
+        loss, grads = jax.value_and_grad(mse_loss)(params, inputs, targets)
+        updates, opt_state = gradient_transform.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+
     # Generate the model                                         
     n_layers = trial.suggest_int("n_layers", n_layers_min, n_layers_max)
     n_hidden = trial.suggest_int("n_hidden", n_hidden_min, n_hidden_max)
-    decay_rate = trial.suggest_float("lr", decay_rate_min, decay_rate_max) 
+    decay_rate = trial.suggest_float("decay_rate", decay_rate_min, decay_rate_max) 
 
     # train MLP 
-    layer_sizes = [thetas.shape[1]] + [n_hidden for range(n_layers)] + [x_pca.shape[1]]
-    learning_rate = 1e-3
+    layer_sizes = [thetas.shape[1]] + [n_hidden for i in range(n_layers)] + [x_pca.shape[1]]
+    learning_rate = 1e-2
 
     # Initialize the MLP, optimizer, and scheduler
     params = init_mlp_params(layer_sizes)
@@ -176,16 +184,16 @@ def Objective(trial):
     opt_state = gradient_transform.init(params)
 
     # Training loop
-    train_loss, valid_loss = [], []
-    for epoch in range(100):
-        epoch_loss = 0.0
+    train_loss, valid_loss, best_valid_loss, best_epoch = [], [], np.inf, 0
+    for epoch in range(n_epochs):
+        epoch_loss = 0.
         for x, y in train_dataloader:
             params, opt_state, loss = update(params, opt_state, x, y)
             epoch_loss += loss
         epoch_loss /= len(train_dataloader)
         train_loss.append(epoch_loss)
 
-        _loss = 0
+        _loss = 0.
         for x, y in valid_dataloader:
             loss = mse_loss(params, x, y)
             _loss += loss
@@ -205,7 +213,7 @@ def Objective(trial):
             print(f"Epoch {epoch}, Loss: {epoch_loss}, Valid Loss: {valid_loss[-1]}")
 
     # save trained parameters 
-    with open(os.path.join(U.data_dir(), 'emus', 'modelb', '%s.%i.pkl' % (study_name, trial)), 'wb') as f:
+    with open(os.path.join(U.data_dir(), 'emus', 'modelb', study_name, '%s.%i.pkl' % (study_name, trial.number)), 'wb') as f:
         pickle.dump(best_params, f)
     return best_valid_loss
 
